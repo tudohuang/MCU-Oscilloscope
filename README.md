@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 4. **Save Data**: You can use the <kbd>Save Data</kbd> option to save the current voltage and spectrum data to a CSV file.
 
-5. **View and Copy Firmware Code**: Use the <mark>Firmware</mark> option to view or copy the microcontroller firmware code used to read ADC data.
+5. **View and Copy Firmware Code**: Use the <kdb>Firmware</kdb> option to view or copy the microcontroller firmware code used to read ADC data.
 
 ## Firmware Code
 

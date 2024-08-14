@@ -89,18 +89,11 @@ void setup() {
 void loop() {
   static int index = 0;
 
-  // Check if it's time to sample
   if (micros() - lastSampleTime >= sampleInterval) {
     lastSampleTime = micros();
     int raw = adc1_get_raw(ADC1_I_CHANNEL);
     i_buffer[index] = raw;
 
-    // Convert ADC value to voltage
-    //voltage_buffer[index] = (raw / 4095.0) * 3.3;
-
-    //Serial.print("Raw: ");
-    //Serial.print(i_buffer[index]);
-    //Serial.print("\tVoltage: ");
     Serial.println(raw);  // Keep four decimal places
 
     index++;
@@ -111,6 +104,11 @@ void loop() {
   }
 }
 ```
+## Pictures
+![image](https://github.com/user-attachments/assets/7b59437c-d602-4442-9086-22a3f064db66)
+
+
+![image](https://github.com/user-attachments/assets/04c1b93b-7918-435a-88d9-ff189b602540)
 
 ## License
 

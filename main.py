@@ -1,281 +1,438 @@
-import tkinter as tk
-from tkinter import ttk
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import numpy as np
+import sys
 import threading
+import csv
+import uuid
+import numpy as np
+from scipy.signal import butter, sosfilt, lfilter, firwin
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QStatusBar, QLabel, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget, QLineEdit, QFileDialog, QFrame, QHBoxLayout, QMenuBar
+)
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
+
+from PySide6.QtCore import QTimer
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import serial.tools.list_ports
 from collections import deque
 import time
-from tkinter import messagebox, filedialog
-#import scipy.signal as signal
-from tkinter import scrolledtext
-import statistics
 
-# 設定參數
-sampling_rate = 1000
-display_seconds = 0.5
-data_points = int(sampling_rate * display_seconds)
-#fir_coeff = signal.firwin(100, [0.03, 0.8], pass_zero=False)
+class OscilloscopeApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MCU Oscilloscope - PySide6 Version")
+        self.resize(800, 600)
 
-# 初始化空數據陣列
-voltage_data = deque(maxlen=data_points)
+        # Parameters
+        self.recording = False
+        self.recording_duration = 60
+        self.serial_port = None
+        self.sampling_rate = 1000
+        self.fir_coeff = firwin(100, [0.03, 0.8], pass_zero=False)
+        self.voltage_data = deque(maxlen=500)  # 用於即時繪圖的 FIFO 緩存
+        self.long_term_data = deque()  # 用於長期數據記錄
+        self.device_timer = QTimer()
+        self.device_timer.timeout.connect(self.auto_detect_device)
+        self.device_timer.start(2000)  # 每 2 秒檢測一次
+        
+        
+        
+        # Initialize UI
+        self.setup_ui()
+        self.apply_styles()
+        self.setWindowIcon(QIcon(r"logo.ico"))
 
-# 自動檢測 Arduino 的 COM 埠
-def detect_esp32_port():
-    ports = list(serial.tools.list_ports.comports())
-    for port in ports:
-        if "USB-SERIAL" in port.description or "CP210" in port.description or "Arduino" in port.description:
-            return port.device
-    return None
+    def setup_ui(self):
+        # Menu Bar
+        menu_bar = QMenuBar()
+        about_action = menu_bar.addAction("About")
+        about_action.triggered.connect(self.show_about)
+        exit_action = menu_bar.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+        self.setMenuBar(menu_bar)
 
-def update_status(new_status):
-    status_var.set(new_status)
+        # Main Widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)  # Horizontal layout for control panel and plots
 
-def show_about():
-    root.after(0, lambda: messagebox.showinfo("About", "This GUI app is a simple oscilloscope for MCU."))
+        # Status Bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready")  # 初始顯示訊息
 
-def show_code():
-    firmware_code = """
-#include <Arduino.h>
-#include "driver/adc.h"
-#include "esp_adc_cal.h"
+        # Control Panel
+        control_panel = QFrame()
+        control_panel.setObjectName("controlPanel")
+        control_panel_layout = QVBoxLayout(control_panel)
+        control_panel_layout.setSpacing(10)
+        main_layout.addWidget(control_panel, 1)  # 1: Weight for resizing
 
-#define SAMPLE_RATE 1000  // 取樣率 (10 kHz)
-#define BUFFER_SIZE 1024   // 緩衝區大小
+        control_title = QLabel("Control Panel")
+        control_title.setObjectName("controlTitle")
+        control_panel_layout.addWidget(control_title, alignment=Qt.AlignCenter)
 
-#define ADC1_I_CHANNEL ADC1_CHANNEL_6  // GPIO 34
+        grid_layout = QVBoxLayout()
+        control_panel_layout.addLayout(grid_layout)
 
-int16_t i_buffer[BUFFER_SIZE];
-float voltage_buffer[BUFFER_SIZE];
-unsigned long lastSampleTime = 0;  // 上次取樣的時間
-unsigned long sampleInterval = 1000000 / SAMPLE_RATE;  // 取樣間隔（微秒）
+        # Duration Input
+        duration_layout = QHBoxLayout()
+        duration_label = QLabel("Duration (s):")
+        duration_label.setObjectName("durationLabel")
+        duration_label.setStyleSheet("color: #61dafb;")
+        self.duration_input = QLineEdit("60")
+        self.duration_input.setPlaceholderText("Set Duration (s)")
+        self.duration_input.setObjectName("durationInput")
+        duration_layout.addWidget(duration_label)
+        duration_layout.addWidget(self.duration_input)
+        control_panel_layout.addLayout(duration_layout)
 
-void setupADC() {
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(ADC1_I_CHANNEL, ADC_ATTEN_DB_11);
-}
+        # Buttons
+        set_duration_btn = QPushButton("Set Duration")
+        set_duration_btn.setObjectName("setDurationBtn")
+        set_duration_btn.clicked.connect(self.set_duration)
+        grid_layout.addWidget(set_duration_btn)
 
-void setup() {
-  Serial.begin(115200);
-  setupADC();
-  Serial.println("ADC initialized");
-}
+        check_connection_btn = QPushButton("Check Connection")
+        check_connection_btn.setObjectName("checkConnectionBtn")
+        check_connection_btn.clicked.connect(self.check_connection)
+        grid_layout.addWidget(check_connection_btn)
 
-void loop() {
-  static int index = 0;
-  
-  // 檢查是否到達取樣時間
-  if (micros() - lastSampleTime >= sampleInterval) {
-    lastSampleTime = micros();
-    int raw = adc1_get_raw(ADC1_I_CHANNEL);
-    i_buffer[index] = raw;
-    
-    // 將 ADC 數值轉換為電壓值
-    //voltage_buffer[index] = (raw / 4095.0) * 3.3;
+        start_recording_btn = QPushButton("Start Recording")
+        start_recording_btn.setObjectName("startRecordingBtn")
+        start_recording_btn.clicked.connect(self.start_recording)
+        grid_layout.addWidget(start_recording_btn)
 
-    //Serial.print("Raw: ");
-    //Serial.print(i_buffer[index]);
-    //Serial.print("\tVoltage: ");
-    Serial.println(raw);  // 保留4位小數
-    
-    index++;
-    
-    if (index >= BUFFER_SIZE) {
-      index = 0;  // 重置索引
+        stop_recording_btn = QPushButton("Stop Recording")
+        stop_recording_btn.setObjectName("stopRecordingBtn")
+        stop_recording_btn.clicked.connect(self.stop_recording)
+        grid_layout.addWidget(stop_recording_btn)
+
+        analyze_csv_btn = QPushButton("Analyze CSV")
+        analyze_csv_btn.setObjectName("analyzeCsvBtn")
+        analyze_csv_btn.clicked.connect(self.analyze_csv)
+        grid_layout.addWidget(analyze_csv_btn)
+        theme_toggle_btn = QPushButton("Toggle Theme")
+        theme_toggle_btn.clicked.connect(self.toggle_theme)
+        grid_layout.addWidget(theme_toggle_btn)
+
+        # Plots Section
+        plots_frame = QFrame()
+        plots_frame.setObjectName("plotsFrame")
+        plots_layout = QVBoxLayout(plots_frame)
+        main_layout.addWidget(plots_frame, 3)  # 3: Weight for resizing
+
+        # Voltage Plot
+        voltage_label = QLabel("Voltage")
+        voltage_label.setAlignment(Qt.AlignCenter)
+        voltage_label.setObjectName("plotLabel")
+        plots_layout.addWidget(voltage_label)
+
+        self.voltage_canvas = self.create_plot("Voltage", "Time (s)", "Voltage (V)")
+        plots_layout.addWidget(self.voltage_canvas)
+
+        # Spectrum Plot
+        spectrum_label = QLabel("Spectrum")
+        spectrum_label.setAlignment(Qt.AlignCenter)
+        spectrum_label.setObjectName("plotLabel")
+        plots_layout.addWidget(spectrum_label)
+
+        self.spectrum_canvas = self.create_plot("Spectrum", "Frequency (Hz)", "Amplitude")
+        plots_layout.addWidget(self.spectrum_canvas)
+
+        # Analysis Plot
+        analysis_label = QLabel("Analysis")
+        analysis_label.setAlignment(Qt.AlignCenter)
+        analysis_label.setObjectName("plotLabel")
+        plots_layout.addWidget(analysis_label)
+
+        self.analysis_canvas = self.create_plot("Analysis", "Frequency (Hz)", "Amplitude")
+        plots_layout.addWidget(self.analysis_canvas)
+
+    def auto_detect_device(self):
+        """自動檢測 ESP32 串口設備是否連接。"""
+        port = self.detect_esp32_port()
+        if port and self.serial_port != port:  # 如果檢測到新的設備
+            self.serial_port = port
+            self.update_status(f"Auto-detected ESP32 on {port}")
+            QMessageBox.information(self, "Device Detected", f"ESP32 auto-detected on {port}.")
+        elif not port and self.serial_port:  # 如果設備被移除
+            self.update_status("ESP32 disconnected.")
+            self.serial_port = None
+            
+    def toggle_theme(self):
+        """切換主題模式（深色和淺色）。"""
+        if self.styleSheet():  # 如果目前有樣式，清空樣式（切換到淺色模式）
+            self.setStyleSheet("")
+            self.update_status("Switched to Light Theme")
+        else:  # 設置深色模式
+            self.apply_styles()
+            self.update_status("Switched to Dark Theme")
+            
+    def apply_styles(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1d1f27;
+                color: #ffffff;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            #controlPanel {
+                background-color: #2a2e38;
+                border-radius: 12px;
+                padding: 20px;
+                margin: 10px;
+            }
+            #controlTitle {
+                font-size: 24px;
+                font-weight: bold;
+                color: #61dafb;
+                margin-bottom: 10px;
+            }
+            QLabel {
+                font-size: 14px;
+                color: #c3c3c3;
+            }
+            #durationInput {
+                background-color: #3a3f4b;
+                color: #ffffff;
+                border: 2px solid #61dafb;
+                border-radius: 8px;
+                padding: 6px 10px;
+                font-size: 14px;
+            }
+            QPushButton {
+                background-color: #61dafb;
+                color: #282c34;
+                border: none;
+                border-radius: 10px;
+                padding: 12px 24px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #52bfe0;
+            }
+            QPushButton:pressed {
+                background-color: #4eaecb;
+            }
+            #plotsFrame {
+                background-color: #1e2029;
+                border-radius: 12px;
+                padding: 15px;
+                margin: 10px;
+            }
+            QLabel#plotLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #61dafb;
+                margin-bottom: 5px;
+            }
+                QStatusBar {
+        background-color: #1d1f27;
+        color: #61dafb;
+        font-size: 14px;
+        font-weight: bold;
     }
-  }
-}
-    """
-    code_window = tk.Toplevel(root)
-    code_window.title("Firmware Code")
-    text = scrolledtext.ScrolledText(code_window, wrap=tk.NONE, height=20, width=80, font=("Times New Roman", 10))
-    text.insert(tk.END, firmware_code)
-    text.configure(state='disabled')
-    text.pack()
 
-def save_code(code):
-    with open("firmware_code.txt", "w") as file:
-        file.write(code)
-    print("Code saved to firmware_code.txt")
-
-def copy_code(code):
-    root.clipboard_clear()
-    root.clipboard_append(code)
-    root.update()
-    print("Code copied to clipboard")
+        """)
 
 
 
 
-# 添加串行連接管理功能
-def manage_serial_connection():
-    port = detect_esp32_port()
-    ports = [p.device for p in serial.tools.list_ports.comports()]
-    selected_port = tk.StringVar(value=port)
-
-    def connect():
-        port = selected_port.get()
-        update_status(f"Connecting to {port}...")
-        threading.Thread(target=read_data, args=(port,), daemon=True).start()
-
-    conn_window = tk.Toplevel(root)
-    conn_window.title("Serial Connection Manager")
-    ttk.Label(conn_window, text="Select COM Port:").pack(side=tk.LEFT, padx=5, pady=5)
-    ttk.Combobox(conn_window, values=ports, textvariable=selected_port).pack(side=tk.LEFT, padx=5, pady=5)
-    ttk.Button(conn_window, text="Connect", command=connect).pack(side=tk.LEFT, padx=5, pady=5)
-
-# 保存數據到 CSV 文件
-def save_data():
-    filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
-    if filename:
-        with open(filename, 'w') as file:
-            file.write("Voltage (V),Frequency (Hz)\n")
-            for i, v in enumerate(voltage_data):
-                file.write(f"{v},{spectrum_data[i] if i < len(spectrum_data) else ''}\n")
-        messagebox.showinfo("Save Data", "Data saved successfully.")
-
-# 數據分析工具
-def analyze_data():
-    if voltage_data:
-        max_val = max(voltage_data)
-        min_val = min(voltage_data)
-        mean_val = statistics.mean(voltage_data)
-        std_dev = statistics.stdev(voltage_data)
-
-        analysis_text = f"Max Voltage: {max_val:.4f} V\nMin Voltage: {min_val:.4f} V\nMean Voltage: {mean_val:.4f} V\nStd Deviation: {std_dev:.4f} V"
-        messagebox.showinfo("Data Analysis", analysis_text)
-    else:
-        messagebox.showinfo("Data Analysis", "No data available for analysis.")
-
-# 建立 tkinter 視窗
-root = tk.Tk()
-root.title("MCU Oscilloscope - Ready")
-
-menu_bar = tk.Menu(root)
-
-menu_bar.add_command(label="About", command=show_about)
-menu_bar.add_command(label="Firmware", command=show_code)
-menu_bar.add_command(label="Serial Connection", command=manage_serial_connection)
-menu_bar.add_command(label="Analyze Data", command=analyze_data)
-menu_bar.add_command(label="Save Data", command=save_data)
-menu_bar.add_command(label="Exit", command=root.quit)
+    def create_plot(self, title, xlabel, ylabel):
+        fig = Figure(figsize=(8, 4), dpi=120, facecolor="#1d1f27")
+        ax = fig.add_subplot(111)
+        ax.set_xlabel(xlabel, fontsize=12, color='#ffffff')
+        ax.set_ylabel(ylabel, fontsize=12, color='#ffffff')
+        ax.tick_params(axis='x', colors='#c3c3c3')
+        ax.tick_params(axis='y', colors='#c3c3c3')
+        ax.grid(color='#444', linestyle='--', linewidth=0.5)
+        ax.set_facecolor('#2a2e38')
+        canvas = FigureCanvas(fig)
+        canvas.ax = ax
+        return canvas
+    def update_voltage_plot(self):
+        """更新電壓圖表。"""
+        filtered_data = lfilter(self.fir_coeff, 1.0, np.array(self.voltage_data))
+        self.voltage_canvas.ax.clear()
+        self.voltage_canvas.ax.plot(filtered_data[100:], color='#55eb34', linewidth=2.0)
+        self.voltage_canvas.ax.set_title("Voltage", fontsize=16, color='white')
+        self.voltage_canvas.ax.set_xlabel("Time (s)", fontsize=12, color='white')
+        self.voltage_canvas.ax.set_ylabel("Voltage (V)", fontsize=12, color='white')
+        self.voltage_canvas.ax.set_ylim(-2, 2)
+        self.voltage_canvas.ax.set_facecolor('#2c3e50')
+        self.voltage_canvas.ax.grid(color='gray', linestyle='--', linewidth=0.5)
+        self.voltage_canvas.draw()
+    def update_spectrum_plot(self):
+        """更新頻譜圖表。"""
+        spectrum_data = np.abs(np.fft.fft(np.array(self.voltage_data)))
+        self.spectrum_canvas.ax.clear()
+        self.spectrum_canvas.ax.plot(spectrum_data[3:], color='#55eb34', linewidth=2.0)
+        self.spectrum_canvas.ax.set_title("Spectrum", fontsize=16, color='white')
+        self.spectrum_canvas.ax.set_xlabel("Frequency (Hz)", fontsize=12, color='white')
+        self.spectrum_canvas.ax.set_ylabel("Amplitude", fontsize=12, color='white')
+        self.spectrum_canvas.ax.set_ylim(0, 30)
+        self.spectrum_canvas.ax.set_facecolor('#2c3e50')
+        self.spectrum_canvas.ax.grid(color='gray', linestyle='--', linewidth=0.5)
+        self.spectrum_canvas.draw()
 
 
+    def read_and_plot_data(self, stop_event):
+        """從 ESP32 獲取數據並即時繪圖。"""
+        partial_line = ''
+        port = self.detect_esp32_port()
+        if port is None:
+            self.update_status("Port not found!")
+            return
 
-root.config(menu=menu_bar)
+        ser = serial.Serial(port, 115200)
+        ser.flush()
+        start_time = time.time()
 
-# 建立 Matplotlib 圖表
-fig_voltage = Figure(figsize=(5, 2), dpi=100)
-ax_voltage = fig_voltage.add_subplot(111)
-ax_voltage.set_title("Voltage")
-ax_voltage.set_xlabel("Time (s)", fontsize=12)
-ax_voltage.set_ylabel("Voltage (V)", fontsize=12)
-ax_voltage.set_xlim(0, display_seconds)
-ax_voltage.set_ylim(-5, 5)
-ax_voltage.set_facecolor('#000000')  # 設定背景顏色
-ax_voltage.grid(color='gray', linestyle='--', linewidth=0.5)
-ax_voltage.tick_params(axis='x')
-ax_voltage.tick_params(axis='y')
+        while not stop_event.is_set():
+            if ser.in_waiting:
+                # 獲取數據並分行處理
+                data = partial_line + ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                lines = data.split('\n')
+                partial_line = lines[-1]
 
-fig_spectrum = Figure(figsize=(5, 2), dpi=100)
-ax_spectrum = fig_spectrum.add_subplot(111)
-ax_spectrum.set_title("Spectrum")
-ax_spectrum.set_xlabel("Frequency (Hz)", fontsize=12)
-ax_spectrum.set_ylabel("Amplitude", fontsize=12)
-ax_spectrum.set_xlim(0, sampling_rate // 2)
-ax_spectrum.set_ylim(0, 1)
-ax_spectrum.set_facecolor('#000000')
-ax_spectrum.grid(color='gray', linestyle='--', linewidth=0.5)
-ax_spectrum.tick_params(axis='x')
-ax_spectrum.tick_params(axis='y')
+                for line in lines[:-1]:
+                    try:
+                        voltage = float(line)
+                        timestamp = time.time() - start_time
+                        self.voltage_data.append(voltage)  # 更新即時繪圖緩存
 
-# 將圖表嵌入 tkinter，上下佈局
-canvas_voltage = FigureCanvasTkAgg(fig_voltage, master=root)
-canvas_voltage.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+                        if self.recording:
+                            self.long_term_data.append((timestamp, voltage))  # 若正在記錄，保存數據
 
-canvas_spectrum = FigureCanvasTkAgg(fig_spectrum, master=root)
-canvas_spectrum.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-start_t = time.time()
+                    except ValueError:
+                        continue
 
-# 資料讀取函數
-def read_data(port):
-    global voltage_data, spectrum_data
-    partial_line = ''
-    if port is None:
-        print("Port not found!")
-        return
-    
-    ser = serial.Serial(port, 115200)
-    ser.flush()
-    count = 0
-    while True:
-        if ser.in_waiting:
-            # 讀取緩衝區內所有資料
-            data = partial_line + ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
-            
-            lines = data.split('\n')
-            partial_line = lines[-1]
-            
-            for line in lines[:-1]:
-                count += 1
-                try:
-                    voltage = float(line) / 4095 * 3.3
-                    voltage_data.append(voltage)
-                except ValueError:
-                    continue
+            # 更新繪圖
+            if len(self.voltage_data) >= 500:
+                self.update_voltage_plot()
+                self.update_spectrum_plot()
 
-def update_plots():
-    global voltage_data, spectrum_data
-    if len(voltage_data) < 500:
-        root.after(200, update_plots)
-        return
-    #filtered_data = signal.lfilter(fir_coeff, 1.0, np.array(voltage_data))
-    filtered_data = np.array(voltage_data)
-    ax_voltage.clear()
-    ax_voltage.plot(np.array(filtered_data)[100:], color='#00ff00', linewidth=1.5)
-    ax_voltage.set_title("Voltage", fontsize=14)
-    ax_voltage.set_xlabel("Time (s)", fontsize=12)
-    ax_voltage.set_ylabel("Voltage (V)", fontsize=12)
-    #ax_voltage.set_ylim(-1, 4)
-    ax_voltage.set_ylim(-4,4)
-    ax_voltage.set_facecolor('#000000')
-    ax_voltage.grid(color='gray', linestyle='--', linewidth=0.5)
-    ax_voltage.tick_params(axis='x')
-    ax_voltage.tick_params(axis='y')
-    canvas_voltage.draw()
-    
-    if len(voltage_data) > 400:
-        spectrum_data = np.abs(np.fft.fft(filtered_data[-100:]))
-        ax_spectrum.clear()
-        ax_spectrum.plot(spectrum_data[3:], color='#00ff00', linewidth=1.5)
-        ax_spectrum.set_title("Spectrum", fontsize=14)
-        ax_spectrum.set_xlabel("Frequency (Hz)", fontsize=12)
-        ax_spectrum.set_ylabel("Amplitude", fontsize=12)
-        ax_spectrum.set_ylim(0, 50)
-        ax_spectrum.set_facecolor('#000000')
-        ax_spectrum.grid(color='gray', linestyle='--', linewidth=0.5)
-        ax_spectrum.tick_params(axis='x')
-        ax_spectrum.tick_params(axis='y')
-        canvas_spectrum.draw()
-        print(np.argmax(spectrum_data[5:30]))
+            time.sleep(0.1)  # 降低 CPU 負載
 
-    root.after(1, update_plots)
+    def show_about(self):
+        self.status_bar.showMessage("This GUI app is a oscilloscope for MCU.")
 
-def check_connection():
-    port = detect_esp32_port()
-    if port is None:
-        update_status("Error: ESP32 not found!")
-        messagebox.showerror("Connection Error", "ESP32 not found. Please connect the device and try again.")
-    else:
-        update_status(f"ESP32 Connected on {port}")
-        threading.Thread(target=read_data, args=(port,), daemon=True).start()
+    def set_duration(self):
+        try:
+            duration = int(self.duration_input.text())
+            self.status_bar.showMessage(f"Recording time set to {duration} seconds.")
+        except ValueError:
+            self.status_bar.showMessage("Invalid duration input.")
 
-status_var = tk.StringVar()
-status_var.set("Ready")
-status_bar = ttk.Label(root, textvariable=status_var, relief=tk.SUNKEN, anchor=tk.W)
-status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
-update_plots()
-check_connection()
-root.mainloop()
+    def update_status(self, new_status):
+        self.status_bar.setStyleSheet("color: #61dafb;")
+        self.status_bar.showMessage(new_status)
+
+    def detect_esp32_port(self):
+        ports = list(serial.tools.list_ports.comports())
+        for port in ports:
+            if any(keyword in port.description for keyword in ["USB-SERIAL", "CP210", "Arduino"]):
+                return port.device
+        return None
+
+    def check_connection(self):
+        port = self.detect_esp32_port()
+        if port is None:
+            self.update_status("ESP32 not found!")
+            QMessageBox.critical(self, "Connection Error", "ESP32 not found. Please connect the device and try again.")
+        else:
+            self.update_status(f"ESP32 connected on {port}")
+            self.stop_event = threading.Event()
+            threading.Thread(target=self.read_and_plot_data, args=(self.stop_event,), daemon=True).start()
+
+
+
+    def start_recording(self):
+        try:
+            self.recording_duration = int(self.duration_input.text())
+            self.long_term_data.clear()
+            self.recording = True
+            self.update_status(f"Recording started for {self.recording_duration} seconds.")
+            QTimer.singleShot(self.recording_duration * 1000, self.stop_recording)
+        except ValueError:
+            QMessageBox.critical(self, "Invalid Input", "Please enter a valid integer for recording time.")
+
+    def stop_recording(self):
+        self.recording = False
+        if self.stop_event:
+            self.stop_event.set()
+        self.update_status("Recording stopped.")
+        self.save_data_to_csv()
+
+
+    def save_data_to_csv(self):
+        file_name, _ = QFileDialog.getSaveFileName(self, "Save Recording", "", "CSV Files (*.csv)")
+        if file_name:
+            with open(file_name, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerow(["Timestamp (s)", "Voltage (V)"])
+                writer.writerows(self.long_term_data)
+            self.update_status(f"Data saved to {file_name}.")
+
+    def analyze_csv(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Open CSV", "", "CSV Files (*.csv)")
+        if not file_path:
+            return
+
+        try:
+            # Load data from CSV
+            data = np.loadtxt(file_path, delimiter=',', skiprows=1)
+            time_data = data[:, 0]
+            signal_data = data[:, 1]
+            sampling_rate = data.shape[0] / (time_data[-1] - time_data[0])
+            print(f'Sampling rate: {sampling_rate:.2f} Hz')
+
+            # High-pass filter
+            cutoff_frequency = 0.1
+            order = 8
+            sos = butter(order, cutoff_frequency, btype='high', fs=sampling_rate, output='sos')
+            filtered_signal = sosfilt(sos, signal_data)
+
+            # Smooth the signal
+            window_length = 100
+            b = np.ones(window_length) / window_length
+            smoothed_signal = lfilter(b, 1, np.abs(filtered_signal))
+
+            # FFT analysis
+            spectrum = np.abs(np.fft.fft(signal_data))
+            freqs = np.fft.fftfreq(len(signal_data), d=1/sampling_rate)
+
+            # Find max frequency
+            max_index = np.argmax(spectrum[1:int(4.5 / (sampling_rate / spectrum.size))]) + 1
+            max_frequency = max_index * sampling_rate / spectrum.size
+            max_amplitude = spectrum[max_index]
+            print(f'Max Frequency: {max_frequency:.2f} Hz')
+
+            # Update the analysis plot
+            self.analysis_canvas.ax.clear()
+            self.analysis_canvas.ax.set_title("Frequency Spectrum")
+            self.analysis_canvas.ax.set_xlabel("Frequency [Hz]")
+            self.analysis_canvas.ax.set_ylabel("Amplitude")
+            self.analysis_canvas.ax.grid(color='gray', linestyle='--', linewidth=0.5)
+            self.analysis_canvas.ax.plot(freqs[1:int(5 / (sampling_rate / spectrum.size))],
+                                        spectrum[1:int(5 / (sampling_rate / spectrum.size))], color='#55eb34')
+            self.analysis_canvas.ax.plot(max_frequency, max_amplitude, 'r*', markersize=10)
+            self.analysis_canvas.draw()
+
+            # Update the status
+            self.update_status(f"Max Frequency: {max_frequency:.2f} Hz, Sampling Rate: {sampling_rate:.2f} Hz")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to analyze CSV file: {e}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(r"G:\.shortcut-targets-by-id\1hTHRprGG3w8dNgqo-yMJyqIEezOBEpgf\108課綱學習歷程\DPL\software\logo.ico"))
+
+    window = OscilloscopeApp()
+    window.show()
+    sys.exit(app.exec())

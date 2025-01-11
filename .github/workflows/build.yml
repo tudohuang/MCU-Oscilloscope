@@ -1,0 +1,48 @@
+name: Build EXE with UPX
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Download UPX
+      run: |
+        curl -L -o upx.zip https://github.com/upx/upx/releases/download/v3.96/upx-3.96-win64.zip
+        tar -xf upx.zip --strip-components=1
+        echo "UPX downloaded"
+
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --noconsole --icon=logo.ico main.py
+
+    - name: Compress EXE with UPX
+      run: |
+        ./upx.exe dist/main.exe
+
+    - name: Upload compressed EXE
+      uses: actions/upload-artifact@v3
+      with:
+        name: compressed-exe
+        path: dist/main.exe
